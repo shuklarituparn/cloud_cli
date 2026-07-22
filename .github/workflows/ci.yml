@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, vet, race and coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Display toolchain
+        run: go version
+
+      - name: Verify module files are tidy
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "The following files are not formatted:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests with race detector and coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages="$(go list ./... | grep -v '/cmd/')"
+          go test -race -count=1 -covermode=atomic -coverprofile=coverage.out $packages
+
+      - name: Enforce coverage threshold
+        env:
+          COVERAGE_MINIMUM: "75"
+        run: ./scripts/check-coverage.sh coverage.out
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    needs: quality
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build snapshot binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          extension=""
+          if [ "$GOOS" = "windows" ]; then
+            extension=".exe"
+          fi
+
+          version="ci-${GITHUB_SHA::12}"
+          commit="${GITHUB_SHA}"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          package="github.com/shuklarituparn/cloud_cli/internal/buildinfo"
+          ldflags="-s -w -X ${package}.Version=${version} -X ${package}.Commit=${commit} -X ${package}.Date=${build_date}"
+
+          mkdir -p dist
+          go build \
+            -trimpath \
+            -ldflags "$ldflags" \
+            -o "dist/cloud_cli-${GOOS}-${GOARCH}${extension}" \
+            ./cmd/cloud_cli
+
+      - name: Smoke-test Linux binary
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./dist/cloud_cli-linux-amd64 version
+          ./dist/cloud_cli-linux-amd64 help >/dev/null
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud_cli-${{ matrix.goos }}-${{ matrix.goarch }}-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  docker:
+    name: Build and smoke-test container
+    runs-on: ubuntu-latest
+    needs: quality
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg VERSION="ci-${GITHUB_SHA::12}" \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --build-arg DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag cloud_cli:ci \
+            .
+
+      - name: Smoke-test image
+        run: docker run --rm cloud_cli:ci version
