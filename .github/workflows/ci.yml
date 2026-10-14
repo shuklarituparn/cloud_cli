@@ -67,7 +67,7 @@ jobs:
         run: ./scripts/check-coverage.sh coverage.out
 
       - name: Upload coverage profile
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: coverage-${{ github.sha }}
           path: coverage.out
@@ -140,7 +140,7 @@ jobs:
           ./dist/cloud_cli-linux-amd64 help >/dev/null
 
       - name: Upload binary
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: cloud_cli-${{ matrix.goos }}-${{ matrix.goarch }}-${{ github.sha }}
           path: dist/*
